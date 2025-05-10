@@ -16,11 +16,13 @@ from fastapi import HTTPException
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from nsflow.backend.utils.agent_network_utils import AgentNetworkUtils
-from nsflow.backend.utils.ns_grpc_service_utils import NsGrpcServiceUtils
+# from nsflow.backend.utils.ns_grpc_service_utils import NsGrpcServiceUtils
 from nsflow.backend.utils.ns_grpc_network_utils import NsGrpcNetworkUtils
 from nsflow.backend.utils.auth_utils import AuthUtils
-from nsflow.backend.models.set_config_model import ConfigRequest
+from nsflow.backend.models.config_model import ConfigRequest
 from nsflow.backend.utils.ns_configs_registry import NsConfigsRegistry
+
+from nsflow.backend.utils.ns_grpc_ws_utils import NsGrpcWsUtils
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,18 +34,24 @@ agent_utils = AgentNetworkUtils()  # Instantiate utility class
 async def set_config(config_req: ConfigRequest, _=Depends(AuthUtils.allow_all)):
     """Sets the configuration for the Neuro-SAN server."""
     try:
-        # Validate the input
-        if not config_req.NS_SERVER_HOST or not config_req.NS_SERVER_PORT:
-            raise HTTPException(status_code=400, detail="Invalid host or port")
-    except ValueError as e:
-        logging.error("Invalid host or port: %s", e)
-        raise HTTPException(status_code=400, detail="Invalid host or port") from e
-    # Set the configuration
-    try:
-        updated_config = NsConfigsRegistry.set_current(str(config_req.NS_SERVER_HOST), config_req.NS_SERVER_PORT)
-        return JSONResponse(content={"message": "Config updated successfully", "config": updated_config.config})
-    except RuntimeError as e:
-        logging.error("Failed to set config: %s", e)
+        connectivity_type = str(config_req.NS_CONNECTIVITY_TYPE).strip()
+        host = str(config_req.NS_SERVER_HOST).strip()
+        port = int(config_req.NS_SERVER_PORT)
+
+        if not connectivity_type or not host or not port:
+            raise HTTPException(status_code=400, detail="Missing connectivity type, host or port")
+
+        updated_config = NsConfigsRegistry.set_current(connectivity_type, host, port)
+        return JSONResponse(
+            content={
+                "message": "Config updated successfully",
+                "config": updated_config.to_dict(),
+                "config_id": updated_config.config_id
+            }
+        )
+
+    except Exception as e:
+        logging.exception("Failed to set config")
         raise HTTPException(status_code=500, detail="Failed to set config") from e
 
 
@@ -51,11 +59,18 @@ async def set_config(config_req: ConfigRequest, _=Depends(AuthUtils.allow_all)):
 async def get_config(_=Depends(AuthUtils.allow_all)):
     """Returns the current configuration of the Neuro-SAN server."""
     try:
-        config = NsConfigsRegistry.get_current().config
-        return JSONResponse(content={"message": "Config retrieved successfully", "config": config})
+        current_config = NsConfigsRegistry.get_current()
+        return JSONResponse(
+            content={
+                "message": "Config retrieved successfully",
+                "config": current_config.to_dict(),
+                "config_id": current_config.config_id
+            }
+        )
+
     except RuntimeError as e:
         logging.error("Failed to retrieve config: %s", e)
-        raise HTTPException(status_code=500, detail="Failed to retrieve config") from e
+        raise HTTPException(status_code=500, detail="No config has been set yet.") from e
 
 
 @router.get("/ping", tags=["Health"])
@@ -70,19 +85,13 @@ def get_networks():
     return agent_utils.list_available_networks()
 
 
-@router.get("/network/{network_name}", responses={200: {"description": "Agent Network found"},
+@router.get("/connectivity/{network_name}", responses={200: {"description": "Agent Network found"},
                                                   404: {"description": "Agent Network not found"}})
 async def get_agent_network(network_name: str):
     """Retrieves the network structure for a given agent network."""
-    # file_path = agent_utils.get_network_file_path(network_name)
-    # logging.info("file_path: %s", file_path)
-    # return agent_utils.parse_agent_network(file_path)
-    grpc_service_utils = NsGrpcServiceUtils(agent_name=network_name)
     try:
-        # Extract metadata from headers
-        metadata: Dict[str, Any] = {}
-        # Delegate to utility function
-        result = await grpc_service_utils.get_connectivity(metadata, network_name)
+        ns_grpc_utils = NsGrpcWsUtils(network_name, None)
+        result = ns_grpc_utils.get_connectivity()
 
     except Exception as e:
         logging.exception("Failed to retrieve connectivity info: %s", e)
@@ -93,13 +102,15 @@ async def get_agent_network(network_name: str):
     return JSONResponse(content=res)
 
 
-@router.get("/connectivity/{network_name}", responses={200: {"description": "Connectivity Info"},
+@router.get("/compact_connectivity/{network_name}", responses={200: {"description": "Connectivity Info"},
                                                        404: {"description": "HOCON file not found"}})
 def get_connectivity_info(network_name: str):
-    """Retrieves connectivity details from a HOCON network configuration file."""
+    """Retrieves the network structure for a given local HOCON based agent network."""
     file_path = agent_utils.get_network_file_path(network_name)
     logging.info("file_path: %s", file_path)
-    return agent_utils.extract_connectivity_info(file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Network name '{network_name}' not found.")
+    return agent_utils.parse_agent_network(file_path)
 
 
 @router.get("/networkconfig/{network_name}", responses={200: {"description": "Connectivity Info"},
